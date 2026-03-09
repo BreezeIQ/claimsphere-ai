@@ -1,6 +1,6 @@
 [project]
 name = "claimsphere-ai-backend"
-version = "0.1.0"
+version = "0.2.0"
 description = "Enterprise healthcare insurance claims processor demo"
 requires-python = ">=3.11"
 dependencies = [

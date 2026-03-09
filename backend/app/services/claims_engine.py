@@ -3,12 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.models import Adjudication, AuditEvent, Claim, ClaimSummary, DashboardOverview, EvidenceItem, FraudAssessment, FraudFactor, GraphPathNode, ValidationCheck
+from app.services.graph_reasoner import GraphReasoner
 from app.services.repository import FileRepository
 
 
 class ClaimsEngine:
-    def __init__(self, repository: FileRepository | None = None):
+    def __init__(self, repository: FileRepository | None = None, graph_reasoner: GraphReasoner | None = None):
         self.repository = repository or FileRepository()
+        self.graph_reasoner = graph_reasoner or GraphReasoner()
 
     def _bundle(self):
         return self.repository.load()
@@ -34,6 +36,15 @@ class ClaimsEngine:
             for auth in self._bundle().authorizations
             if auth.tenant_id == claim.tenant_id and auth.member_id == claim.member_id and auth.provider_id == claim.rendering_provider_id
         ]
+
+    def _context(self, claim_id: str):
+        claim = self.get_claim(claim_id)
+        member = self._member(claim.member_id)
+        provider = self._provider(claim.rendering_provider_id)
+        policy = self._policy(claim.policy_id)
+        benefits = self._benefits(claim.policy_id)
+        authorizations = self._authorizations(claim)
+        return claim, member, provider, policy, benefits, authorizations
 
     def list_tenants(self):
         return self._bundle().tenants
@@ -68,18 +79,16 @@ class ClaimsEngine:
         return next(claim for claim in bundle.claims if claim.id == claim_id)
 
     def validate_claim(self, claim_id: str):
-        claim = self.get_claim(claim_id)
-        member = self._member(claim.member_id)
-        provider = self._provider(claim.rendering_provider_id)
-        benefits = {benefit.cpt_code: benefit for benefit in self._benefits(claim.policy_id)}
-        auths = {auth.cpt_code: auth for auth in self._authorizations(claim) if auth.status == "approved"}
+        claim, member, provider, _policy, benefits, authorizations = self._context(claim_id)
+        benefit_map = {benefit.cpt_code: benefit for benefit in benefits}
+        auths = {auth.cpt_code: auth for auth in authorizations if auth.status == "approved"}
 
         checks = [
             ValidationCheck(name="member_active", status="pass" if member.coverage_status == "active" else "fail", detail=f"Member coverage is {member.coverage_status}.", weight=0.24),
             ValidationCheck(name="claim_completeness", status="pass" if claim.attachments else "warning", detail="Clinical attachment present." if claim.attachments else "No attachments supplied.", weight=0.16),
         ]
         for line in claim.lines:
-            benefit = benefits.get(line.cpt_code)
+            benefit = benefit_map.get(line.cpt_code)
             if not benefit:
                 checks.append(ValidationCheck(name=f"benefit_{line.line_number}", status="fail", detail=f"No benefit mapping found for CPT {line.cpt_code}.", weight=0.2))
                 continue
@@ -89,6 +98,10 @@ class ClaimsEngine:
             network_ok = benefit.network_requirement == "any" or provider.network_status == "in_network"
             checks.append(ValidationCheck(name=f"network_{line.line_number}", status="pass" if network_ok else "warning", detail="Network requirement satisfied." if network_ok else "Out-of-network exception requires review.", weight=0.1))
         return checks
+
+    def graph_reasoning(self, claim_id: str):
+        claim, member, provider, policy, benefits, authorizations = self._context(claim_id)
+        return self.graph_reasoner.analyze(claim, member, policy, provider, benefits, authorizations)
 
     def _fraud_model(self, claim_id: str):
         claim = self.get_claim(claim_id)
@@ -138,19 +151,7 @@ class ClaimsEngine:
         return evidence
 
     def _graph(self, claim: Claim):
-        member = self._member(claim.member_id)
-        policy = self._policy(claim.policy_id)
-        provider = self._provider(claim.rendering_provider_id)
-        graph = [
-            GraphPathNode(from_node=f"Member {member.first_name} {member.last_name}", edge="covered_by", to_node=f"Policy {policy.plan_name}", status="verified"),
-            GraphPathNode(from_node=f"Provider {provider.organization_name}", edge="network_status", to_node=provider.network_status, status="verified"),
-        ]
-        auths = {auth.cpt_code: auth for auth in self._authorizations(claim) if auth.status == "approved"}
-        for line in claim.lines:
-            graph.append(GraphPathNode(from_node=f"ClaimLine {line.line_number}", edge="bills", to_node=f"CPT {line.cpt_code}", status="verified"))
-            if line.cpt_code in auths:
-                graph.append(GraphPathNode(from_node=f"ClaimLine {line.line_number}", edge="requires_auth", to_node=auths[line.cpt_code].id, status="verified"))
-        return graph
+        return self.graph_reasoning(claim.id).path
 
     def _completeness(self, checks: list[ValidationCheck]) -> float:
         total = sum(item.weight for item in checks) or 1.0
@@ -166,22 +167,23 @@ class ClaimsEngine:
         checks = self.validate_claim(claim_id)
         claim = self.get_claim(claim_id)
         evidence = self._evidence(claim)
-        graph = self._graph(claim)
+        graph_reasoning = self.graph_reasoning(claim_id)
+        graph = graph_reasoning.path
         fraud = self._fraud_model(claim_id)
         completeness = self._completeness(checks)
         policy_match = round(max(0.0, min(sum(item.score for item in evidence) / len(evidence) - (0.12 * sum(1 for item in checks if item.status == "fail")), 0.99)), 2)
         risk_score = round(min(0.99, fraud.score + 0.08 * sum(1 for item in checks if item.status == "fail") + 0.03 * sum(1 for item in checks if item.status == "warning")), 2)
-        confidence = round(max(0.05, min(0.99, policy_match * 0.45 + completeness * 0.35 + (1 - risk_score) * 0.2)), 2)
+        confidence = round(max(0.05, min(0.99, policy_match * 0.38 + completeness * 0.28 + (1 - risk_score) * 0.18 + graph_reasoning.confidence * 0.16)), 2)
 
-        if any(item.name == "member_active" and item.status == "fail" for item in checks):
+        if any(item.name == "member_active" and item.status == "fail" for item in checks) or graph_reasoning.decision_hint == "deny":
             status = "denied"
-            reason = "Denied because member coverage was not active on the date of service."
+            reason = "Denied because the graph reasoning layer found a blocked eligibility path or inactive coverage relationship."
         elif any(item.name.startswith("benefit_") and item.status == "fail" for item in checks):
             status = "denied"
             reason = "Denied because at least one billed procedure is not covered under the active policy."
-        elif any(item.name.startswith("auth_") and item.status == "fail" for item in checks):
+        elif any(item.name.startswith("auth_") and item.status == "fail" for item in checks) or graph_reasoning.decision_hint == "review":
             status = "manual_review"
-            reason = "Manual review required because authorization evidence is missing for an auth-gated service."
+            reason = "Manual review required because the graph reasoning layer found an incomplete authorization or network path."
         elif fraud.level == "high":
             status = "manual_review"
             reason = "Manual review required because fraud risk exceeded the straight-through threshold."
@@ -190,10 +192,24 @@ class ClaimsEngine:
             reason = "Manual review required because policy coverage is favorable, but pricing or provider risk signals remain elevated."
         else:
             status = "approved"
-            reason = "Approved because policy, graph, and fraud checks all met the automation threshold."
+            reason = "Approved because policy, graph reasoning, and fraud checks all met the automation threshold."
 
-        explanation = f"{reason} Key factors: policy match {policy_match:.2f}, fraud score {fraud.score:.2f}, data completeness {completeness:.2f}."
-        adjudication = Adjudication(decision_status=status, confidence_score=confidence, risk_score=risk_score, policy_match_score=policy_match, data_completeness_score=completeness, explanation_text=explanation, rules_fired=checks, policy_evidence=evidence, graph_path=graph)
+        explanation = (
+            f"{reason} Key factors: policy match {policy_match:.2f}, graph confidence {graph_reasoning.confidence:.2f}, "
+            f"fraud score {fraud.score:.2f}, data completeness {completeness:.2f}."
+        )
+        adjudication = Adjudication(
+            decision_status=status,
+            confidence_score=confidence,
+            risk_score=risk_score,
+            policy_match_score=policy_match,
+            data_completeness_score=completeness,
+            explanation_text=explanation,
+            rules_fired=checks,
+            policy_evidence=evidence,
+            graph_path=graph,
+            graph_reasoning=graph_reasoning,
+        )
 
         bundle = self._bundle()
         for idx, current in enumerate(bundle.claims):
@@ -203,7 +219,7 @@ class ClaimsEngine:
                 updated.adjudication = adjudication
                 updated.status = status
                 updated.updated_at = datetime.now(timezone.utc).isoformat()
-                updated.audit_events.insert(0, AuditEvent(created_at=updated.updated_at, event_type="claim_adjudicated", actor="hybrid-agent", message=f"Claim {status} with confidence {confidence:.2f}.", metadata={"decision": status, "confidence": confidence, "risk_score": risk_score}))
+                updated.audit_events.insert(0, AuditEvent(created_at=updated.updated_at, event_type="claim_adjudicated", actor="hybrid-agent", message=f"Claim {status} with confidence {confidence:.2f}.", metadata={"decision": status, "confidence": confidence, "risk_score": risk_score, "graph_decision_hint": graph_reasoning.decision_hint}))
                 bundle.claims[idx] = updated
                 self.repository.save(bundle)
                 return adjudication
@@ -222,10 +238,8 @@ class ClaimsEngine:
         return claim
 
     def claim_detail(self, claim_id: str):
-        claim = self.get_claim(claim_id)
-        member = self._member(claim.member_id)
-        provider = self._provider(claim.rendering_provider_id)
-        policy = self._policy(claim.policy_id)
+        claim, member, provider, policy, _benefits, _authorizations = self._context(claim_id)
+        graph_reasoning = self.graph_reasoning(claim_id)
         return {
             "id": claim.id,
             "tenant_id": claim.tenant_id,
@@ -245,6 +259,7 @@ class ClaimsEngine:
             "extraction": claim.extraction,
             "fraud": claim.fraud.model_dump() if claim.fraud else None,
             "adjudication": claim.adjudication.model_dump() if claim.adjudication else None,
+            "graph_reasoning": graph_reasoning.model_dump(),
             "validation": [item.model_dump() for item in self.validate_claim(claim_id)],
             "audit_events": [event.model_dump() for event in claim.audit_events],
         }
@@ -270,7 +285,7 @@ class ClaimsEngine:
             architecture_layers=[
                 {"name": "Claims Intake", "status": "live", "detail": "X12, FHIR, and attachment intake normalized into a canonical claim object."},
                 {"name": "Semantic Retrieval", "status": "live", "detail": "Policy recall over benefit notes and manual excerpts with evidence scoring."},
-                {"name": "Graph Reasoning", "status": "live", "detail": "Member-policy-benefit-provider-auth relationships validate exact eligibility paths."},
+                {"name": "Graph Reasoning", "status": "live", "detail": "A dedicated graph reasoner traverses member, policy, benefit, provider, and authorization edges before adjudication."},
                 {"name": "Fraud Detection", "status": "live", "detail": "Heuristic fraud scoring simulates anomaly, provider abuse, and pricing variance checks."},
                 {"name": "Decision Trace", "status": "live", "detail": "Every automated decision stores rules, evidence, graph path, confidence, and audit history."},
             ],

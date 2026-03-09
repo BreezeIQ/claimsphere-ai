@@ -35,6 +35,14 @@ def claim_detail(claim_id: str):
         raise HTTPException(status_code=404, detail="Claim not found") from exc
 
 
+@router.get("/claims/{claim_id}/graph-reasoning")
+def graph_reasoning(claim_id: str):
+    try:
+        return engine.graph_reasoning(claim_id)
+    except StopIteration as exc:
+        raise HTTPException(status_code=404, detail="Claim not found") from exc
+
+
 @router.post("/claims/{claim_id}/validate")
 def validate_claim(claim_id: str):
     try:
@@ -69,5 +77,6 @@ def explanation(claim_id: str):
         "claim_id": claim_id,
         "adjudication": claim.get("adjudication"),
         "fraud": claim.get("fraud"),
+        "graph_reasoning": claim.get("graph_reasoning"),
         "audit_events": claim.get("audit_events"),
     }

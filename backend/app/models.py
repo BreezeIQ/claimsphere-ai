@@ -117,6 +117,22 @@ class GraphPathNode(BaseModel):
     status: str
 
 
+class GraphInsight(BaseModel):
+    title: str
+    status: Literal["supported", "blocked", "warning"]
+    detail: str
+    evidence: list[str] = Field(default_factory=list)
+
+
+class GraphReasoningResult(BaseModel):
+    entry_point: str
+    confidence: float
+    decision_hint: Literal["approve", "deny", "review"]
+    path: list[GraphPathNode]
+    insights: list[GraphInsight]
+    ontology_nodes: list[str] = Field(default_factory=list)
+
+
 class FraudFactor(BaseModel):
     factor: str
     impact: float
@@ -140,6 +156,7 @@ class Adjudication(BaseModel):
     rules_fired: list[ValidationCheck]
     policy_evidence: list[EvidenceItem]
     graph_path: list[GraphPathNode]
+    graph_reasoning: GraphReasoningResult | None = None
 
 
 class AuditEvent(BaseModel):
